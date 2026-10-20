@@ -45,16 +45,17 @@ const resolverSuffix = ".acme"
 
 // Configuration holds ACME configuration provided by users.
 type Configuration struct {
-	Email                string   `description:"Email address used for registration." json:"email,omitempty" toml:"email,omitempty" yaml:"email,omitempty"`
-	CAServer             string   `description:"CA server to use." json:"caServer,omitempty" toml:"caServer,omitempty" yaml:"caServer,omitempty"`
-	PreferredChain       string   `description:"Preferred chain to use." json:"preferredChain,omitempty" toml:"preferredChain,omitempty" yaml:"preferredChain,omitempty" export:"true"`
-	Profile              string   `description:"Certificate profile to use." json:"profile,omitempty" toml:"profile,omitempty" yaml:"profile,omitempty" export:"true"`
-	EmailAddresses       []string `description:"CSR email addresses to use." json:"emailAddresses,omitempty" toml:"emailAddresses,omitempty" yaml:"emailAddresses,omitempty"`
-	DisableCommonName    bool     `description:"Disable the common name in the CSR." json:"disableCommonName,omitempty" toml:"disableCommonName,omitempty" yaml:"disableCommonName,omitempty" export:"true"`
-	Storage              string   `description:"Storage to use." json:"storage,omitempty" toml:"storage,omitempty" yaml:"storage,omitempty" export:"true"`
-	KeyType              string   `description:"KeyType used for generating certificate private key. Allow value 'EC256', 'EC384', 'RSA2048', 'RSA4096', 'RSA8192'." json:"keyType,omitempty" toml:"keyType,omitempty" yaml:"keyType,omitempty" export:"true"`
-	EAB                  *EAB     `description:"External Account Binding to use." json:"eab,omitempty" toml:"eab,omitempty" yaml:"eab,omitempty"`
-	CertificatesDuration int      `description:"Certificates' duration in hours." json:"certificatesDuration,omitempty" toml:"certificatesDuration,omitempty" yaml:"certificatesDuration,omitempty" export:"true"`
+	Email                          string          `description:"Email address used for registration." json:"email,omitempty" toml:"email,omitempty" yaml:"email,omitempty"`
+	CAServer                       string          `description:"CA server to use." json:"caServer,omitempty" toml:"caServer,omitempty" yaml:"caServer,omitempty"`
+	PreferredChain                 string          `description:"Preferred chain to use." json:"preferredChain,omitempty" toml:"preferredChain,omitempty" yaml:"preferredChain,omitempty" export:"true"`
+	Profile                        string          `description:"Certificate profile to use." json:"profile,omitempty" toml:"profile,omitempty" yaml:"profile,omitempty" export:"true"`
+	EmailAddresses                 []string        `description:"CSR email addresses to use." json:"emailAddresses,omitempty" toml:"emailAddresses,omitempty" yaml:"emailAddresses,omitempty"`
+	DisableCommonName              bool            `description:"Disable the common name in the CSR." json:"disableCommonName,omitempty" toml:"disableCommonName,omitempty" yaml:"disableCommonName,omitempty" export:"true"`
+	Storage                        string          `description:"Storage to use." json:"storage,omitempty" toml:"storage,omitempty" yaml:"storage,omitempty" export:"true"`
+	KeyType                        string          `description:"KeyType used for generating certificate private key. Allow value 'EC256', 'EC384', 'RSA2048', 'RSA4096', 'RSA8192'." json:"keyType,omitempty" toml:"keyType,omitempty" yaml:"keyType,omitempty" export:"true"`
+	EAB                            *EAB            `description:"External Account Binding to use." json:"eab,omitempty" toml:"eab,omitempty" yaml:"eab,omitempty"`
+	CertificatesDuration           int             `description:"Certificates' duration in hours." json:"certificatesDuration,omitempty" toml:"certificatesDuration,omitempty" yaml:"certificatesDuration,omitempty" export:"true"`
+	CertificatesCleanupGracePeriod ptypes.Duration `description:"Time a certificate must be unused before it is removed. Set to 0 to disable cleanup." json:"certificatesCleanupGracePeriod,omitempty" toml:"certificatesCleanupGracePeriod,omitempty" yaml:"certificatesCleanupGracePeriod,omitempty" export:"true"`
 
 	ReusePrivateKey *bool `description:"Reuse the private key from the previous certificate generation during the renewal." json:"reusePrivateKey,omitempty" toml:"reusePrivateKey,omitempty" yaml:"reusePrivateKey,omitempty" export:"true"`
 
@@ -77,6 +78,7 @@ func (a *Configuration) SetDefaults() {
 	a.Storage = "acme.json"
 	a.KeyType = "RSA4096"
 	a.CertificatesDuration = 3 * 30 * 24 // 90 Days
+	a.CertificatesCleanupGracePeriod = ptypes.Duration(24 * time.Hour)
 	a.ClientTimeout = ptypes.Duration(2 * time.Minute)
 	a.ClientResponseHeaderTimeout = ptypes.Duration(30 * time.Second)
 	a.CertificateTimeout = ptypes.Duration(30 * time.Second)
@@ -143,8 +145,12 @@ type Provider struct {
 	TLSChallengeProvider  challenge.Provider
 	HTTPChallengeProvider challenge.Provider
 
-	certificates   []*CertAndStore
-	certificatesMu sync.RWMutex
+	certificates           []*CertAndStore
+	certificatesMu         sync.RWMutex
+	certificateOperationMu sync.Mutex
+	unusedSince            map[string]time.Time
+	configObserved         bool
+	observedConfig         *dynamic.Configuration
 
 	account                *Account
 	client                 *lego.Client
@@ -182,6 +188,10 @@ func (p *Provider) Init() error {
 
 	if p.CertificatesDuration < 1 {
 		return errors.New("cannot manage certificates with duration lower than 1 hour")
+	}
+
+	if p.CertificatesCleanupGracePeriod < 0 {
+		return errors.New("certificatesCleanupGracePeriod must not be negative")
 	}
 
 	if p.ClientTimeout < p.ClientResponseHeaderTimeout {
@@ -245,10 +255,9 @@ func (p *Provider) Provide(configurationChan chan<- dynamic.Message, pool *safe.
 	ctx := logger.WithContext(context.Background())
 
 	p.pool = pool
+	p.configurationChan = configurationChan
 
 	p.watchNewDomains(ctx)
-
-	p.configurationChan = configurationChan
 
 	p.certificatesMu.RLock()
 	msg := p.buildMessage()
@@ -270,6 +279,23 @@ func (p *Provider) Provide(configurationChan chan<- dynamic.Message, pool *safe.
 				p.renewCertificates(ctx, renewPeriod)
 			case <-ctxPool.Done():
 				ticker.Stop()
+				return
+			}
+		}
+	})
+
+	cleanupInterval := min(time.Hour, time.Duration(p.CertificatesCleanupGracePeriod))
+	if cleanupInterval <= 0 {
+		return nil
+	}
+	cleanupTicker := time.NewTicker(cleanupInterval)
+	pool.GoCtx(func(ctxPool context.Context) {
+		for {
+			select {
+			case <-cleanupTicker.C:
+				p.cleanupUnusedCertificates(ctx)
+			case <-ctxPool.Done():
+				cleanupTicker.Stop()
 				return
 			}
 		}
@@ -481,6 +507,175 @@ func (p *Provider) register(ctx context.Context, client *lego.Client) (*acme.Ext
 	return client.Registration.Register(ctx, registration.RegisterOptions{TermsOfServiceAgreed: true})
 }
 
+func (p *Provider) observeCertificateUsage(ctx context.Context, config dynamic.Configuration) {
+	now := time.Now()
+
+	p.certificatesMu.Lock()
+	defer p.certificatesMu.Unlock()
+
+	if p.unusedSince == nil {
+		p.unusedSince = make(map[string]time.Time)
+	}
+	p.configObserved = true
+	p.observedConfig = config.DeepCopy()
+
+	for _, cert := range p.certificates {
+		key := certificateKey(cert)
+		if certificateIsReferenced(ctx, cert, config) {
+			delete(p.unusedSince, key)
+			continue
+		}
+
+		if _, ok := p.unusedSince[key]; !ok {
+			p.unusedSince[key] = now
+			log.Ctx(ctx).Debug().Strs("domains", cert.Domain.ToStrArray()).Msg("ACME certificate is no longer referenced by a router")
+		}
+	}
+}
+
+func certificateIsReferenced(ctx context.Context, cert *CertAndStore, config dynamic.Configuration) bool {
+	domains := cert.Domain.ToStrArray()
+	if len(cert.Certificate.Certificate) > 0 {
+		parsed, err := getX509Certificate(ctx, &cert.Certificate)
+		if err != nil {
+			return true
+		}
+		domains = parsed.DNSNames
+	}
+	for _, domain := range domains {
+		if config.HTTP != nil {
+			for _, route := range config.HTTP.Routers {
+				if route.TLS == nil {
+					continue
+				}
+				if len(route.TLS.Domains) > 0 {
+					for _, configuredDomain := range route.TLS.Domains {
+						if domainsOverlap(configuredDomain.ToStrArray(), domain) {
+							return true
+						}
+					}
+				}
+
+				matches, err := httpmuxer.RuleMatchesHost(route.Rule, route.RuleSyntax, domain)
+				if err != nil {
+					log.Ctx(ctx).Warn().Err(err).Msg("Unable to determine ACME certificate usage from HTTP router")
+					return true
+				}
+				if matches {
+					return true
+				}
+			}
+		}
+
+		if config.TCP != nil {
+			for _, route := range config.TCP.Routers {
+				if route.TLS == nil || route.TLS.Passthrough {
+					continue
+				}
+				if len(route.TLS.Domains) > 0 {
+					for _, configuredDomain := range route.TLS.Domains {
+						if domainsOverlap(configuredDomain.ToStrArray(), domain) {
+							return true
+						}
+					}
+				}
+
+				matches, err := tcpmuxer.RuleMatchesHost(route.Rule, route.RuleSyntax, domain)
+				if err != nil {
+					log.Ctx(ctx).Warn().Err(err).Msg("Unable to determine ACME certificate usage from TCP router")
+					return true
+				}
+				if matches {
+					return true
+				}
+			}
+		}
+
+		if config.TLS != nil {
+			for _, store := range config.TLS.Stores {
+				if store.DefaultGeneratedCert != nil && store.DefaultGeneratedCert.Domain != nil && domainsOverlap(store.DefaultGeneratedCert.Domain.ToStrArray(), domain) {
+					return true
+				}
+			}
+		}
+	}
+
+	return false
+}
+
+func domainsOverlap(configuredDomains []string, certificateDomain string) bool {
+	for _, configuredDomain := range configuredDomains {
+		if types.MatchDomain(types.CanonicalDomain(configuredDomain), types.CanonicalDomain(certificateDomain)) ||
+			types.MatchDomain(types.CanonicalDomain(certificateDomain), types.CanonicalDomain(configuredDomain)) {
+			return true
+		}
+	}
+	return false
+}
+
+func certificateKey(cert *CertAndStore) string {
+	domains := slices.Clone(cert.Domain.ToStrArray())
+	for idx := range domains {
+		domains[idx] = types.CanonicalDomain(domains[idx])
+	}
+	slices.Sort(domains)
+	return cert.Store + "\x00" + strings.Join(domains, "\x00")
+}
+
+func (p *Provider) cleanupUnusedCertificates(ctx context.Context) {
+	gracePeriod := time.Duration(p.CertificatesCleanupGracePeriod)
+	if gracePeriod <= 0 {
+		return
+	}
+
+	p.certificateOperationMu.Lock()
+	defer p.certificateOperationMu.Unlock()
+
+	now := time.Now()
+
+	p.certificatesMu.Lock()
+	defer p.certificatesMu.Unlock()
+
+	if !p.configObserved || len(p.unusedSince) == 0 {
+		return
+	}
+
+	remaining := make([]*CertAndStore, 0, len(p.certificates))
+	removed := make([]*CertAndStore, 0)
+	for _, cert := range p.certificates {
+		unusedAt, ok := p.unusedSince[certificateKey(cert)]
+		if ok && now.Sub(unusedAt) >= gracePeriod {
+			removed = append(removed, cert)
+			continue
+		}
+		remaining = append(remaining, cert)
+	}
+
+	if len(removed) == 0 {
+		return
+	}
+
+	if err := p.Store.SaveCertificates(p.ResolverName, remaining); err != nil {
+		log.Ctx(ctx).Error().Err(err).Strs("domains", removedDomains(removed)).Msg("Unable to save ACME certificates after cleanup")
+		return
+	}
+
+	p.certificates = remaining
+	for _, cert := range removed {
+		delete(p.unusedSince, certificateKey(cert))
+	}
+	p.configurationChan <- p.buildMessage()
+	log.Ctx(ctx).Info().Strs("domains", removedDomains(removed)).Msg("Removed unused ACME certificates")
+}
+
+func removedDomains(certificates []*CertAndStore) []string {
+	var domains []string
+	for _, cert := range certificates {
+		domains = append(domains, cert.Domain.ToStrArray()...)
+	}
+	return domains
+}
+
 func (p *Provider) resolveDomains(ctx context.Context, domains []string, tlsStore string) {
 	logger := log.Ctx(ctx)
 
@@ -521,6 +716,8 @@ func (p *Provider) watchNewDomains(ctx context.Context) {
 		for {
 			select {
 			case config := <-p.configFromListenerChan:
+				p.observeCertificateUsage(ctx, config)
+
 				if config.TCP != nil {
 					for routerName, route := range config.TCP.Routers {
 						if route.TLS == nil || route.TLS.CertResolver != p.ResolverName {
@@ -802,6 +999,19 @@ func (p *Provider) addCertificateForDomain(domain types.Domain, crt *certificate
 		p.certificates = append(p.certificates, &CertAndStore{Certificate: cert, Store: tlsStore})
 	}
 
+	if p.configObserved {
+		if p.unusedSince == nil {
+			p.unusedSince = make(map[string]time.Time)
+		}
+		added := &CertAndStore{Certificate: cert, Store: tlsStore}
+		key := certificateKey(added)
+		if certificateIsReferenced(context.Background(), added, *p.observedConfig) {
+			delete(p.unusedSince, key)
+		} else if _, exists := p.unusedSince[key]; !exists {
+			p.unusedSince[key] = time.Now()
+		}
+	}
+
 	p.configurationChan <- p.buildMessage()
 
 	return p.Store.SaveCertificates(p.ResolverName, p.certificates)
@@ -912,17 +1122,26 @@ func (p *Provider) buildMessage() dynamic.Message {
 }
 
 func (p *Provider) renewCertificates(ctx context.Context, renewPeriod time.Duration) {
+	p.certificateOperationMu.Lock()
+	defer p.certificateOperationMu.Unlock()
+
 	logger := log.Ctx(ctx)
 
 	logger.Info().Msg("Testing certificate renew...")
 
+	now := time.Now()
 	p.certificatesMu.RLock()
 
 	var certificates []*CertAndStore
 	for _, cert := range p.certificates {
+		unusedAt, unused := p.unusedSince[certificateKey(cert)]
+		if gracePeriod := time.Duration(p.CertificatesCleanupGracePeriod); unused && gracePeriod > 0 && now.Sub(unusedAt) >= gracePeriod {
+			continue
+		}
+
 		crt, err := getX509Certificate(ctx, &cert.Certificate)
 		// If there's an error, we assume the cert is broken, and needs update
-		if err != nil || crt == nil || crt.NotAfter.Before(time.Now().Add(renewPeriod)) {
+		if err != nil || crt == nil || crt.NotAfter.Before(now.Add(renewPeriod)) {
 			certificates = append(certificates, cert)
 		}
 	}

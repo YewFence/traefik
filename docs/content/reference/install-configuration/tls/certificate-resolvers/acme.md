@@ -89,6 +89,7 @@ ACME certificate resolvers have the following configuration options:
 | <a id="opt-acme-eab-kid" href="#opt-acme-eab-kid" title="#opt-acme-eab-kid">`acme.eab.kid`</a> | Key identifier from External CA. | "" | No |
 | <a id="opt-acme-eab-hmacEncoded" href="#opt-acme-eab-hmacEncoded" title="#opt-acme-eab-hmacEncoded">`acme.eab.hmacEncoded`</a> | HMAC key from External CA, should be in Base64 URL Encoding without padding format. | "" | No |
 | <a id="opt-acme-certificatesDuration" href="#opt-acme-certificatesDuration" title="#opt-acme-certificatesDuration">`acme.certificatesDuration`</a> | The certificates' duration in hours, exclusively used to determine renewal dates. | 2160 | No |
+| <a id="opt-acme-certificatesCleanupGracePeriod" href="#opt-acme-certificatesCleanupGracePeriod" title="#opt-acme-certificatesCleanupGracePeriod">`acme.certificatesCleanupGracePeriod`</a> | Time an ACME certificate must be unused before cleanup, for example `48h`. Set to `0` to disable cleanup. | 24h | No |
 | <a id="opt-acme-clientTimeout" href="#opt-acme-clientTimeout" title="#opt-acme-clientTimeout">`acme.clientTimeout`</a> | Timeout for HTTP Client used to communicate with the ACME server. | 2m | No |
 | <a id="opt-acme-clientResponseHeaderTimeout" href="#opt-acme-clientResponseHeaderTimeout" title="#opt-acme-clientResponseHeaderTimeout">`acme.clientResponseHeaderTimeout`</a> | Timeout for response headers for HTTP Client used to communicate with the ACME server. | 30s | No |
 | <a id="opt-acme-certificateTimeout" href="#opt-acme-certificateTimeout" title="#opt-acme-certificateTimeout">`acme.certificateTimeout`</a> | Timeout for obtaining the certificate during the finalization request. Set this if the ACME server is slow to issue a certificate. | 30s | No |
@@ -108,13 +109,19 @@ ACME certificate resolvers have the following configuration options:
 
 ## Automatic Certificate Renewal
 
-Traefik automatically tracks the expiry date of certificates it generates. Certificates that are no longer used may still be renewed, as Traefik does not currently check if the certificate is being used before renewing.
+Traefik automatically tracks the expiry date of certificates it generates.
 
-By default, Traefik manages 90-day certificates and starts renewing them 30 days before their expiry.
-When using a certificate resolver that issues certificates with custom durations, the `certificatesDuration` option can be used to configure the certificates' duration.
+By default, Traefik manages 90-day certificates and starts renewing them 30 days before their expiry. When using a certificate resolver that issues certificates with custom durations, use `certificatesDuration` to configure the certificates' duration.
 
-!!! note
-    Certificates that are no longer used may still be renewed, as Traefik does not currently check if the certificate is being used before renewing.
+### Unused Certificate Cleanup
+
+Traefik removes an ACME certificate when none of its domain names intersects the hostnames of any HTTP or TLS-terminating TCP router for `certificatesCleanupGracePeriod`, which defaults to `24h`. Explicit `tls.domains` and generated default certificates also keep matching certificates in use. Routers can use certificates managed by other resolvers or omit `certResolver`; these routers also prevent cleanup.
+
+Traefik starts the grace period after receiving routing configuration. A matching router cancels the pending cleanup. If the router disappears again, a new grace period starts. The pending cleanup times are held in memory, so restarting Traefik restarts the grace period. Traefik checks for cleanup every hour, or every grace period if it is shorter than an hour. Set `certificatesCleanupGracePeriod` to `0` to disable cleanup.
+
+The host checks support `Host`, `HostRegexp`, `HostSNI`, `HostSNIRegexp`, and their Boolean combinations. Other request or connection conditions remain unconstrained because a certificate is selected before the request is routed. If a host rule is invalid or its intersection exceeds the computation limit, Traefik logs a warning and retains the certificate.
+
+Certificates can still be renewed during the grace period. After the grace period, Traefik skips renewal and removes unused certificates from its ACME storage and TLS configuration without restarting. Cleanup removes whole certificates; it does not remove individual SANs from a certificate that is still in use. If a router returns after cleanup, it needs a new certificate, which can cause a signing delay or CA rate limiting.
 
 ## The Different ACME Challenges
 

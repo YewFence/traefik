@@ -1,17 +1,16 @@
 package tcp
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"regexp"
 	"slices"
-	"strconv"
 	"strings"
 
 	"github.com/go-acme/lego/v5/challenge/tlsalpn01"
 	"github.com/rs/zerolog/log"
 	"github.com/traefik/traefik/v3/pkg/ip"
+	"github.com/traefik/traefik/v3/pkg/muxer"
 )
 
 var tcpFuncsV2 = map[string]func(*matchersTree, ...string) error{
@@ -133,7 +132,7 @@ func hostSNIRegexpV2(tree *matchersTree, templates ...string) error {
 	var regexps []*regexp.Regexp
 
 	for _, template := range templates {
-		preparedPattern, err := preparePattern(template)
+		preparedPattern, err := muxer.HostTemplatePattern(template, true)
 		if err != nil {
 			return fmt.Errorf("invalid pattern value for \"HostSNIRegexp\" matcher, %q is not a valid pattern: %w", template, err)
 		}
@@ -157,85 +156,4 @@ func hostSNIRegexpV2(tree *matchersTree, templates ...string) error {
 	}
 
 	return nil
-}
-
-// preparePattern builds a regexp pattern from the initial user defined expression.
-// This function reuses the code dedicated to host matching of the newRouteRegexp func from the gorilla/mux library.
-// https://github.com/containous/mux/tree/8ffa4f6d063c1e2b834a73be6a1515cca3992618.
-func preparePattern(template string) (string, error) {
-	// Check if it is well-formed.
-	idxs, errBraces := braceIndices(template)
-	if errBraces != nil {
-		return "", errBraces
-	}
-
-	defaultPattern := "[^.]+"
-	pattern := bytes.NewBufferString("")
-
-	// Host SNI matching is case-insensitive
-	_, _ = fmt.Fprint(pattern, "(?i)")
-
-	pattern.WriteByte('^')
-	var end int
-	for i := 0; i < len(idxs); i += 2 {
-		// Set all values we are interested in.
-		raw := template[end:idxs[i]]
-		end = idxs[i+1]
-		parts := strings.SplitN(template[idxs[i]+1:end-1], ":", 2)
-		name := parts[0]
-
-		patt := defaultPattern
-		if len(parts) == 2 {
-			patt = parts[1]
-		}
-
-		// Name or pattern can't be empty.
-		if name == "" || patt == "" {
-			return "", fmt.Errorf("mux: missing name or pattern in %q",
-				template[idxs[i]:end])
-		}
-
-		// Build the regexp pattern.
-		_, _ = fmt.Fprintf(pattern, "%s(?P<%s>%s)", regexp.QuoteMeta(raw), varGroupName(i/2), patt)
-	}
-
-	// Add the remaining.
-	raw := template[end:]
-	pattern.WriteString(regexp.QuoteMeta(raw))
-	pattern.WriteByte('$')
-
-	return pattern.String(), nil
-}
-
-// varGroupName builds a capturing group name for the indexed variable.
-// This function is a copy of varGroupName func from the gorilla/mux library.
-// https://github.com/containous/mux/tree/8ffa4f6d063c1e2b834a73be6a1515cca3992618.
-func varGroupName(idx int) string {
-	return "v" + strconv.Itoa(idx)
-}
-
-// braceIndices returns the first level curly brace indices from a string.
-// This function is a copy of braceIndices func from the gorilla/mux library.
-// https://github.com/containous/mux/tree/8ffa4f6d063c1e2b834a73be6a1515cca3992618.
-func braceIndices(s string) ([]int, error) {
-	var level, idx int
-	var idxs []int
-	for i := range len(s) {
-		switch s[i] {
-		case '{':
-			if level++; level == 1 {
-				idx = i
-			}
-		case '}':
-			if level--; level == 0 {
-				idxs = append(idxs, idx, i+1)
-			} else if level < 0 {
-				return nil, fmt.Errorf("mux: unbalanced braces in %q", s)
-			}
-		}
-	}
-	if level != 0 {
-		return nil, fmt.Errorf("mux: unbalanced braces in %q", s)
-	}
-	return idxs, nil
 }
